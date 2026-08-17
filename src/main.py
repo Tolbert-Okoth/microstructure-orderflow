@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("AuctionMain")
 
 
-def run_full_backtest(df: pd.DataFrame, fixed_lots: float = 0.10, kelly_fraction: float = 0.40):
+def run_full_backtest(df: pd.DataFrame, initial_capital: float = 100.0, fixed_lots: float = 0.01, kelly_fraction: float = 0.40):
     logger.info(f"Loaded {len(df):,} bars from {df['time'].iloc[0]} to {df['time'].iloc[-1]}")
     logger.info("Generating Market Profile features and Auction Market Theory signals...")
 
@@ -25,13 +25,13 @@ def run_full_backtest(df: pd.DataFrame, fixed_lots: float = 0.10, kelly_fraction
     data_with_signals = strategy.generate_auction_signals(df)
 
     # 1. Fixed Lots Backtest
-    cfg_fixed = BacktestConfig(fixed_lots=fixed_lots)
+    cfg_fixed = BacktestConfig(initial_capital=initial_capital, fixed_lots=fixed_lots)
     bt_fixed = AuctionBacktester(cfg_fixed)
     res_fixed = bt_fixed.run_backtest(data_with_signals)
     m_fixed = res_fixed["metrics"]
 
     print("\n=======================================================")
-    print(f"=== COMPLETE AUCTION BACKTEST: FIXED LOTS ({fixed_lots}) ===")
+    print(f"=== AUCTION BACKTEST: ${initial_capital:,.2f} BALANCE | FIXED LOTS ({fixed_lots}) ===")
     print("=======================================================")
     print(f"Initial Capital:          ${m_fixed['initial_capital']:,.2f}")
     print(f"Final Capital:            ${m_fixed['final_capital']:,.2f}")
@@ -48,13 +48,13 @@ def run_full_backtest(df: pd.DataFrame, fixed_lots: float = 0.10, kelly_fraction
     print("=======================================================\n")
 
     # 2. Friction-Adjusted Kelly Sizing Backtest
-    cfg_kelly = BacktestConfig(fixed_lots=None, kelly_fraction=kelly_fraction)
+    cfg_kelly = BacktestConfig(initial_capital=initial_capital, fixed_lots=None, kelly_fraction=kelly_fraction)
     bt_kelly = AuctionBacktester(cfg_kelly)
     res_kelly = bt_kelly.run_backtest(data_with_signals)
     m_kelly = res_kelly["metrics"]
 
     print("=======================================================")
-    print(f"=== COMPLETE AUCTION BACKTEST: FRICTION KELLY ({kelly_fraction}x) ===")
+    print(f"=== AUCTION BACKTEST: ${initial_capital:,.2f} BALANCE | FRICTION KELLY ({kelly_fraction}x) ===")
     print("=======================================================")
     print(f"Initial Capital:          ${m_kelly['initial_capital']:,.2f}")
     print(f"Final Capital:            ${m_kelly['final_capital']:,.2f}")
@@ -71,13 +71,13 @@ def run_full_backtest(df: pd.DataFrame, fixed_lots: float = 0.10, kelly_fraction
     print("=======================================================\n")
 
 
-def run_walk_forward_cv(df: pd.DataFrame):
+def run_walk_forward_cv(df: pd.DataFrame, initial_capital: float = 100.0, fixed_lots: float = 0.01):
     logger.info("Executing 5-Fold Purged Walk-Forward Validation...")
     validator = PurgedWalkForwardValidator(n_folds=5)
-    res = validator.run_validation(df)
+    res = validator.run_validation(df, bt_config=BacktestConfig(initial_capital=initial_capital, fixed_lots=fixed_lots))
 
     print("\n=======================================================")
-    print("=== PURGED WALK-FORWARD CROSS-VALIDATION REPORT ===")
+    print(f"=== PURGED WALK-FORWARD CROSS-VALIDATION REPORT (${initial_capital:,.2f} BALANCE) ===")
     print("=======================================================")
     print(f"Total OOS Trades:             {res['total_oos_trades']}")
     print(f"Total Net PnL:                ${res['aggregate_net_pnl']:+,.2f}")
@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="Run historical backtest")
     parser.add_argument("--walk-forward", action="store_true", help="Run 5-fold Purged Cross-Validation")
     parser.add_argument("--optimize", action="store_true", help="Run Optuna study")
+    parser.add_argument("--capital", type=float, default=100.0, help="Initial capital in USD (default: 100.0)")
+    parser.add_argument("--lots", type=float, default=0.01, help="Fixed lot sizing (default: 0.01 micro-lots)")
     parser.add_argument("--trials", type=int, default=35, help="Number of Optuna trials")
     parser.add_argument("--bars", type=int, default=50000, help="Number of bars to analyze")
 
@@ -107,9 +109,9 @@ def main():
         df = connector.load_cached_data()
 
     if args.backtest:
-        run_full_backtest(df)
+        run_full_backtest(df, initial_capital=args.capital, fixed_lots=args.lots)
     elif args.walk_forward:
-        run_walk_forward_cv(df)
+        run_walk_forward_cv(df, initial_capital=args.capital, fixed_lots=args.lots)
     elif args.optimize:
         tuner = AuctionOptunaTuner(df.iloc[-25000:])
         best = tuner.run_optimization(args.trials)
@@ -117,7 +119,7 @@ def main():
         for k, v in best.items():
             print(f"  {k}: {v}")
     else:
-        run_full_backtest(df)
+        run_full_backtest(df, initial_capital=args.capital, fixed_lots=args.lots)
 
 
 if __name__ == "__main__":
