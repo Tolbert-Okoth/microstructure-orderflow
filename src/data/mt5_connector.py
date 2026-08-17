@@ -1,113 +1,75 @@
 """
-MetaTrader 5 Connector & Parquet Storage Layer.
-Streams real live tick and OHLCV rates directly from the local MT5 terminal.
+MT5 Data Connector for Real XAUUSD Bars.
 """
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import MetaTrader5 as mt5
 import pandas as pd
-import numpy as np
-
-try:
-    import MetaTrader5 as mt5
-except ImportError:
-    mt5 = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("MT5Connector")
 
-STORAGE_DIR = Path("data/storage")
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-
 
 class MT5Connector:
-    """
-    Handles robust local MT5 terminal connectivity, rate fetching,
-    and parquet serialization for Gold (XAUUSD).
-    """
-
-    def __init__(self, symbol: str = "XAUUSD", timeframe: str = "M5"):
+    def __init__(self, symbol: str = "XAUUSD", timeframe: int = mt5.TIMEFRAME_M5, storage_dir: str = "data/storage"):
         self.symbol = symbol
-        self.timeframe_str = timeframe
-        self.tf_map = {
-            "M1": mt5.TIMEFRAME_M1 if mt5 else 1,
-            "M5": mt5.TIMEFRAME_M5 if mt5 else 5,
-            "M15": mt5.TIMEFRAME_M15 if mt5 else 15,
-            "H1": mt5.TIMEFRAME_H1 if mt5 else 60,
-            "H4": mt5.TIMEFRAME_H4 if mt5 else 240,
-            "D1": mt5.TIMEFRAME_D1 if mt5 else 1440,
-        }
-        self.parquet_path = STORAGE_DIR / f"{self.symbol}_{self.timeframe_str}.parquet"
+        self.timeframe = timeframe
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.parquet_path = self.storage_dir / f"{self.symbol}_M5.parquet"
 
-    def initialize(self) -> bool:
-        """Initializes connection to MT5 terminal."""
-        if mt5 is None:
-            logger.error("MetaTrader5 python package is not installed.")
-            return False
+    def connect(self) -> bool:
         if not mt5.initialize():
-            logger.error(f"MT5 initialize failed: {mt5.last_error()}")
+            logger.error(f"MT5 initialization failed: {mt5.last_error()}")
             return False
-        
-        # Ensure symbol is selected in MarketWatch
-        if not mt5.symbol_select(self.symbol, True):
-            logger.warning(f"Failed to select symbol {self.symbol} in MarketWatch.")
-        logger.info(f"Connected to MT5 terminal. Symbol: {self.symbol}, Timeframe: {self.timeframe_str}")
+        logger.info(f"Connected to MetaTrader 5 Terminal v{mt5.version()}")
         return True
 
-    def shutdown(self):
-        """Closes MT5 terminal connection."""
-        if mt5:
-            mt5.shutdown()
-            logger.info("MT5 connection shut down.")
+    def disconnect(self) -> None:
+        mt5.shutdown()
+        logger.info("MT5 connection closed.")
 
-    def fetch_historical_bars(self, count: int = 50000) -> pd.DataFrame:
-        """
-        Fetches the latest `count` historical OHLCV bars directly from MT5.
-        Includes real volume, tick volume, and dynamic bid-ask spread in points.
-        """
-        if not self.initialize():
-            raise RuntimeError("Cannot fetch data: MT5 initialization failed.")
+    def fetch_historical_bars(self, count: int = 50000) -> Optional[pd.DataFrame]:
+        if not self.connect():
+            return None
         
-        tf = self.tf_map.get(self.timeframe_str, mt5.TIMEFRAME_M5)
-        rates = mt5.copy_rates_from_pos(self.symbol, tf, 0, count)
-        self.shutdown()
-
-        if rates is None or len(rates) == 0:
-            raise ValueError(f"No rates returned for {self.symbol} from MT5: {mt5.last_error() if mt5 else ''}")
-
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        
-        # Rename columns to standard lowercase
-        df = df.rename(columns={
-            "tick_volume": "volume",
-            "real_volume": "real_volume"
-        })
-        
-        # Fill zero spread with rolling median if missing
-        if "spread" not in df.columns or df["spread"].iloc[-1] == 0:
-            df["spread"] = 35.0  # Default ~35 points on XAUUSD
-        else:
-            df["spread"] = df["spread"].astype(float)
-            df["spread"] = df["spread"].replace(0, np.nan).ffill().bfill()
-
-        # Sort chronologically and drop duplicates
-        df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-        logger.info(f"Fetched {len(df):,} bars from {df['time'].iloc[0]} to {df['time'].iloc[-1]}")
-        return df
-
-    def sync_to_parquet(self, count: int = 50000) -> Path:
-        """Fetches from MT5 and persists clean parquet file."""
-        df = self.fetch_historical_bars(count=count)
-        df.to_parquet(self.parquet_path, index=False)
-        logger.info(f"Persisted clean historical dataset to {self.parquet_path}")
-        return self.parquet_path
+        try:
+            logger.info(f"Fetching {count:,} M5 bars for {self.symbol}...")
+            rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, count)
+            if rates is None or len(rates) == 0:
+                logger.error(f"Failed to fetch rates: {mt5.last_error()}")
+                return None
+            
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            df = df.rename(columns={"tick_volume": "volume"})
+            df = df[["time", "open", "high", "low", "close", "volume", "spread", "real_volume"]]
+            df = df.sort_values("time").reset_index(drop=True)
+            
+            # Save to Parquet
+            df.to_parquet(self.parquet_path, engine="pyarrow", index=False)
+            logger.info(f"Saved {len(df):,} bars to {self.parquet_path}")
+            return df
+        finally:
+            self.disconnect()
 
     def load_cached_data(self) -> pd.DataFrame:
-        """Loads cached parquet data if exists, otherwise fetches and caches."""
-        if self.parquet_path.exists():
-            df = pd.read_parquet(self.parquet_path)
-            logger.info(f"Loaded {len(df):,} cached bars from {self.parquet_path}")
+        if not self.parquet_path.exists():
+            logger.info("Parquet cache missing, fetching live from MT5...")
+            df = self.fetch_historical_bars()
+            if df is None:
+                raise RuntimeError("Could not fetch data from MT5 and no cache available.")
             return df
-        logger.info(f"No cache found at {self.parquet_path}. Fetching from MT5...")
-        return self.fetch_historical_bars()
+        
+        df = pd.read_parquet(self.parquet_path)
+        logger.info(f"Loaded {len(df):,} cached bars from {self.parquet_path}")
+        return df
+
+
+if __name__ == "__main__":
+    connector = MT5Connector("XAUUSD")
+    df = connector.fetch_historical_bars(50000)
+    if df is not None:
+        print(f"Data successfully fetched: {len(df)} bars from {df['time'].iloc[0]} to {df['time'].iloc[-1]}")

@@ -1,4 +1,11 @@
-from src.backtest.microstructure_backtester import MicrostructureBacktester, BacktestConfig
-from src.backtest.walk_forward import WalkForwardEngine
+"""
+Auction Backtesting & Walk-Forward Validation.
+"""
+from src.backtest.auction_backtester import AuctionBacktester, BacktestConfig
+from src.backtest.walk_forward import PurgedWalkForwardValidator
 
-__all__ = ["MicrostructureBacktester", "BacktestConfig", "WalkForwardEngine"]
+__all__ = [
+    "AuctionBacktester",
+    "BacktestConfig",
+    "PurgedWalkForwardValidator",
+]

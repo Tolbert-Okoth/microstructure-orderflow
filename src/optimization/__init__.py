@@ -1,3 +1,6 @@
-from src.optimization.optuna_tuner import MicrostructureOptunaTuner
+"""
+Auction Market Theory Optimization.
+"""
+from src.optimization.optuna_tuner import AuctionOptunaTuner
 
-__all__ = ["MicrostructureOptunaTuner"]
+__all__ = ["AuctionOptunaTuner"]

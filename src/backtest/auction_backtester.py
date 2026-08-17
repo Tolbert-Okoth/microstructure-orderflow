@@ -1,44 +1,47 @@
 """
-Institutional Microstructure Backtester.
-Simulates realistic broker order execution with dynamic spreads, Bouchaud square-root slippage,
-zero-lookahead t+1 Open fills, 50-EMA trailing exits, and friction-adjusted Kelly sizing.
+Auction Market Theory Causal Backtesting Simulator.
+Implements realistic microstructure execution:
+- Causal bar t+1 Open fills
+- Dynamic MT5 spreads
+- Bouchaud square-root non-linear slippage model
+- Intrabar Stop Loss and Take Profit barrier checking
+- Dynamic 50-EMA trailing stops on candle close
+- Friction-adjusted Kelly Criterion position sizing
 """
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger("AuctionBacktester")
+
 
 @dataclass
 class BacktestConfig:
-    """Configuration for Microstructure Backtester."""
-    initial_capital: float = 10000.0   # Account base balance ($)
-    contract_size: float = 100.0       # 100 oz per standard lot on XAUUSD
-    point_value: float = 0.01          # Minimum price increment ($0.01 per point)
-    slippage_y_coef: float = 0.70      # Bouchaud Square-Root Law universal constant Y
-    fixed_lots: Optional[float] = 0.10 # Fixed lot size (if None, uses Kelly sizing)
-    kelly_fraction: float = 0.40       # Friction-adjusted Kelly multiplier
+    """Configuration parameters for Auction Backtester."""
+    initial_capital: float = 10000.0    # Initial account capital in USD
+    contract_size: float = 100.0        # XAUUSD 1 lot = 100 oz
+    point_value: float = 0.01           # 1 MT5 spread point = $0.01 in Gold
+    slippage_y_coef: float = 0.50       # Bouchaud non-linear slippage coefficient
+    tp_atr_mult: float = 5.0            # Take profit multiplier in ATR units
+    sl_atr_mult: float = 2.8            # Stop loss multiplier in ATR units
+    ema_trailing_period: int = 50       # Trailing EMA period evaluated at candle close
+    max_holding_bars: int = 20          # Max holding duration (20 M5 bars = 1.6 hours)
+    fixed_lots: Optional[float] = 0.10  # If set, use fixed lot sizing (e.g. 0.10 lots)
+    kelly_fraction: float = 0.40        # Fractional Kelly sizing multiplier (Half-Kelly)
     atr_period: int = 14
-    tp_atr_mult: float = 5.0           # Take-profit ATR runner barrier
-    sl_atr_mult: float = 2.2           # Stop-loss ATR barrier
-    max_holding_bars: int = 24         # Maximum holding period (2 hours on M5)
-    ema_trailing_period: int = 50      # 50-EMA trailing exit evaluated at candle close
 
 
-class MicrostructureBacktester:
+class AuctionBacktester:
     """
-    Simulates high-fidelity institutional order execution for XAUUSD:
-    - Zero Lookahead: Signal at bar t -> Executed at bar t+1 Open.
-    - Dynamic MT5 Spreads: Applied at both entry and exit.
-    - Bouchaud Square-Root Law Slippage: Slippage = Y · ATR · sqrt(Lots / NormalLots)
-    - 50-EMA Candle-Close Trailing Exits.
+    Executes high-fidelity simulation with zero look-ahead bias and realistic market friction.
     """
 
     def __init__(self, config: BacktestConfig = BacktestConfig()):
         self.cfg = config
 
     def _compute_atr(self, df: pd.DataFrame) -> pd.Series:
-        """Computes causal Average True Range."""
         high = df["high"]
         low = df["low"]
         close = df["close"]
@@ -75,6 +78,9 @@ class MicrostructureBacktester:
         trailing_ema_arr = data["trailing_ema"].values
         trade_signal_arr = data["trade_signal"].values if "trade_signal" in data.columns else np.zeros(n_bars)
         time_arr = data["time"].values
+        
+        prev_vah_arr = data["prev_vah"].values if "prev_vah" in data.columns else np.full(n_bars, np.nan)
+        prev_val_arr = data["prev_val"].values if "prev_val" in data.columns else np.full(n_bars, np.nan)
 
         for i in range(1, n_bars - 1):
             curr_close = close_arr[i]
@@ -184,7 +190,7 @@ class MicrostructureBacktester:
                     entry_slippage = self.cfg.slippage_y_coef * atr_val * 0.03 * np.sqrt(lots / 0.10)
                     realized_entry = fill_open + (entry_spread / 2.0 + entry_slippage) if direction == 1 else fill_open - (entry_spread / 2.0 + entry_slippage)
 
-                    # Structural Barriers
+                    # Dynamic Structural Target & Stop based on Value Area & ATR
                     if direction == 1:
                         sl_price = realized_entry - (self.cfg.sl_atr_mult * atr_val)
                         tp_price = realized_entry + (self.cfg.tp_atr_mult * atr_val)
@@ -205,87 +211,95 @@ class MicrostructureBacktester:
 
             equity_curve.append(capital)
 
-        # Performance Metrics Calculation
-        metrics = self._calculate_metrics(trades, equity_curve)
+        # Performance Metrics Computation
+        metrics = self._calculate_metrics(trades, equity_curve, capital)
         return {
             "metrics": metrics,
             "trades": trades,
             "equity_curve": equity_curve
         }
 
-    def _calculate_metrics(self, trades: List[Dict], equity_curve: List[float]) -> Dict:
-        """Calculates institutional risk and performance metrics."""
-        if len(trades) == 0:
+    def _calculate_metrics(self, trades: List[Dict], equity_curve: List[float], final_capital: float) -> Dict:
+        if not trades:
             return {
                 "total_trades": 0,
-                "net_profit": 0.0,
+                "winning_trades": 0,
+                "losing_trades": 0,
                 "win_rate": 0.0,
                 "profit_factor": 0.0,
+                "total_net_pnl": 0.0,
+                "total_return_pct": 0.0,
+                "max_drawdown_pct": 0.0,
                 "sharpe_ratio": 0.0,
                 "sortino_ratio": 0.0,
-                "max_drawdown_pct": 0.0,
-                "total_return_pct": 0.0
+                "monthly_breakdown": {}
             }
 
-        pnls = np.array([t["net_pnl"] for t in trades])
-        wins = pnls[pnls > 0]
-        losses = pnls[pnls < 0]
+        pnls = [t["net_pnl"] for t in trades]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
 
-        total_net_pnl = float(np.sum(pnls))
-        total_gross_win = float(np.sum(wins)) if len(wins) > 0 else 0.0
-        total_gross_loss = float(np.sum(np.abs(losses))) if len(losses) > 0 else 0.0
+        n_trades = len(trades)
+        n_wins = len(wins)
+        n_losses = len(losses)
+        win_rate = (n_wins / n_trades) * 100.0 if n_trades > 0 else 0.0
 
-        win_rate = float(len(wins) / len(pnls) * 100.0)
-        profit_factor = float(total_gross_win / max(total_gross_loss, 1e-4)) if total_gross_loss > 0 else 99.0
+        gross_profit = sum(wins) if wins else 0.0
+        gross_loss = abs(sum(losses)) if losses else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
 
-        # Drawdown calculation
-        eq = np.array(equity_curve)
-        peaks = np.maximum.accumulate(eq)
-        drawdowns = (peaks - eq) / peaks * 100.0
-        max_drawdown = float(np.max(drawdowns))
+        total_net_pnl = sum(pnls)
+        total_return_pct = ((final_capital - self.cfg.initial_capital) / self.cfg.initial_capital) * 100.0
 
-        # Sharpe & Sortino
-        trade_returns = pnls / self.cfg.initial_capital
-        mean_ret = np.mean(trade_returns)
-        std_ret = np.std(trade_returns)
-        downside_std = np.std(trade_returns[trade_returns < 0]) if np.sum(trade_returns < 0) > 0 else 1e-6
+        # Maximum Drawdown calculation
+        eq_arr = np.array(equity_curve)
+        peaks = np.maximum.accumulate(eq_arr)
+        drawdowns = (peaks - eq_arr) / peaks
+        max_drawdown_pct = float(np.max(drawdowns)) * 100.0 if len(drawdowns) > 0 else 0.0
 
-        # Annualized Sharpe (~250 trading days * ~2 trades/day = ~500 trades/yr)
-        annual_factor = np.sqrt(500.0)
-        sharpe = float((mean_ret / max(std_ret, 1e-6)) * annual_factor)
-        sortino = float((mean_ret / max(downside_std, 1e-6)) * annual_factor)
+        # Annualized Sharpe & Sortino (Assuming 252 trading days / ~72,576 M5 bars per year)
+        pnl_arr = np.array(pnls)
+        mean_trade_pnl = np.mean(pnl_arr) if len(pnl_arr) > 0 else 0.0
+        std_trade_pnl = np.std(pnl_arr) if len(pnl_arr) > 0 else 1.0
+
+        trades_per_year = n_trades * (72576.0 / max(len(equity_curve), 1))
+        ann_factor = np.sqrt(max(trades_per_year, 1.0))
+
+        sharpe_ratio = float((mean_trade_pnl / max(std_trade_pnl, 1e-6)) * ann_factor)
+
+        downside_pnls = [p for p in pnls if p < 0]
+        downside_std = np.std(downside_pnls) if downside_pnls else 1e-6
+        sortino_ratio = float((mean_trade_pnl / max(downside_std, 1e-6)) * ann_factor)
 
         # Monthly breakdown
-        monthly: Dict[str, Dict] = {}
-        for t in trades:
-            month_key = str(t["exit_time"])[:7] # YYYY-MM
-            if month_key not in monthly:
-                monthly[month_key] = {"net_pnl": 0.0, "trades": 0, "wins": 0, "losses": 0, "win_pnl": 0.0, "loss_pnl": 0.0}
-            monthly[month_key]["trades"] += 1
-            monthly[month_key]["net_pnl"] += t["net_pnl"]
-            if t["net_pnl"] > 0:
-                monthly[month_key]["wins"] += 1
-                monthly[month_key]["win_pnl"] += t["net_pnl"]
-            else:
-                monthly[month_key]["losses"] += 1
-                monthly[month_key]["loss_pnl"] += abs(t["net_pnl"])
-
-        for k, v in monthly.items():
-            v["win_rate"] = (v["wins"] / v["trades"] * 100.0) if v["trades"] > 0 else 0.0
-            v["profit_factor"] = (v["win_pnl"] / max(v["loss_pnl"], 1e-4)) if v["loss_pnl"] > 0 else 99.0
+        trades_df = pd.DataFrame(trades)
+        monthly_breakdown = {}
+        if not trades_df.empty and "exit_time" in trades_df.columns:
+            trades_df["month"] = pd.to_datetime(trades_df["exit_time"]).dt.strftime("%Y-%m")
+            for month, group in trades_df.groupby("month"):
+                m_pnls = group["net_pnl"].values
+                m_wins = [p for p in m_pnls if p > 0]
+                m_losses = [p for p in m_pnls if p < 0]
+                m_pf = (sum(m_wins) / abs(sum(m_losses))) if sum(m_losses) != 0 else (99.0 if m_wins else 0.0)
+                monthly_breakdown[month] = {
+                    "net_pnl": float(np.sum(m_pnls)),
+                    "trades": len(group),
+                    "win_rate": float((len(m_wins) / len(group)) * 100.0),
+                    "profit_factor": float(m_pf)
+                }
 
         return {
             "initial_capital": self.cfg.initial_capital,
-            "final_capital": equity_curve[-1],
-            "total_net_pnl": total_net_pnl,
-            "total_return_pct": (total_net_pnl / self.cfg.initial_capital) * 100.0,
-            "total_trades": len(trades),
-            "winning_trades": len(wins),
-            "losing_trades": len(losses),
+            "final_capital": final_capital,
+            "total_net_pnl": float(total_net_pnl),
+            "total_return_pct": float(total_return_pct),
+            "total_trades": n_trades,
+            "winning_trades": n_wins,
+            "losing_trades": n_losses,
             "win_rate": round(win_rate, 2),
             "profit_factor": round(profit_factor, 2),
-            "sharpe_ratio": round(sharpe, 2),
-            "sortino_ratio": round(sortino, 2),
-            "max_drawdown_pct": round(max_drawdown, 2),
-            "monthly_breakdown": monthly
+            "max_drawdown_pct": round(max_drawdown_pct, 2),
+            "sharpe_ratio": round(sharpe_ratio, 2),
+            "sortino_ratio": round(sortino_ratio, 2),
+            "monthly_breakdown": monthly_breakdown
         }
